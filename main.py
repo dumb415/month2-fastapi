@@ -1,72 +1,59 @@
-﻿import httpx  # async-capable HTTP client (requests can't do await)
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+﻿import os                                      # stdlib module for env vars, like System.getenv() in Java
+from dotenv import load_dotenv                 # reads .env file into the process environment
+from fastapi import FastAPI, HTTPException     # HTTPException = throw-able HTTP error, like a custom Java exception carrying a status code
+from fastapi.middleware.cors import CORSMiddleware  # from Day 4: lets Next.js on :3000 call this API
+from pydantic import BaseModel                 # base class for validated request/response shapes (Day 3)
+from supabase import create_client, Client     # create_client() = factory, like DriverManager.getConnection(); Client = its type
 
+load_dotenv()  # MUST run before os.getenv(), or your keys come back None
+
+# ---------- Config (fail fast: crash at startup, not on the first request) ----------
+SUPABASE_URL = os.getenv("SUPABASE_URL")       # returns None if the variable is missing (no exception)
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+if not SUPABASE_URL or not SUPABASE_KEY:       # `not x` is True for None or "" (like !x in C++ for pointers/strings)
+    raise RuntimeError("SUPABASE_URL / SUPABASE_KEY missing from .env")  # raise = throw
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)  # `: Client` is a type hint (documentation only, not enforced at runtime)
+TABLE = "items"                                # one constant, so a table rename touches one line, not four
+
+# ---------- App ----------
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000"],   # exact origin, never "*" in real projects
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Constants in UPPER_SNAKE_CASE, one place to change (like #define / constexpr)
-EXTERNAL_URL = "https://jsonplaceholder.typicode.com/posts"
-EXTERNAL_TIMEOUT_SECONDS = 5.0  # NEVER call an external API without a timeout
+# ---------- Models ----------
+class ItemCreate(BaseModel):                   # shape of the incoming POST body
+    name: str                                  # required; wrong type or missing -> automatic 422
 
+class ItemResponse(BaseModel):                 # shape of what we send back; mirrors the table columns
+    id: int
+    name: str
+    created_at: str
 
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    # Day 4 catch-all: clean JSON instead of a raw traceback
-    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+# ---------- Routes ----------
+# Plain `def`, NOT `async def`: the supabase client is synchronous (blocking).
+# FastAPI runs plain `def` routes in a thread pool, so a slow DB call won't freeze the event loop.
+# Rule: blocking library -> `def`; awaitable library (httpx.AsyncClient) -> `async def`.
 
+@app.get("/items", response_model=list[ItemResponse])  # response_model filters/validates output; list[X] = like List<X> in Java
+def list_items():
+    res = supabase.table(TABLE).select("*").order("id").execute()  # .table() picks the table, .select("*") = SELECT *, .order("id") = ORDER BY id
+    return res.data                                    # .data = list of dicts, one per row (like a ResultSet already converted to maps)
 
-@app.get("/")
-async def root():
-    return {"message": "API is running"}
+@app.post("/items", response_model=ItemResponse, status_code=201)  # 201 Created is the correct code for a successful insert
+def create_item(body: ItemCreate):                     # FastAPI parses the JSON body into an ItemCreate for you
+    res = supabase.table(TABLE).insert({"name": body.name}).execute()  # .insert(dict) = INSERT INTO items (name) VALUES (...)
+    if not res.data:                                   # insert should return the new row; empty means it didn't happen
+        raise HTTPException(status_code=500, detail="Insert failed")
+    return res.data[0]                                 # data is a list, so [0] is the one row we inserted (id/created_at filled by the DB)
 
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}  # tiny endpoint we use to prove the loop is free
-
-
-# ===== DAY 5 =====
-@app.get("/external")
-async def get_external(limit: int = 5):  # `async def` = coroutine, can use await inside
-    params = {"_limit": limit}  # query string: ?_limit=5 (httpx builds it for you)
-
-    try:
-        # `async with` = RAII for async resources: client opens here, closes
-        # automatically on exit, even on exception (like a C++ scoped object)
-        async with httpx.AsyncClient(timeout=EXTERNAL_TIMEOUT_SECONDS) as client:
-            # `await` = "pause this request until the network replies; let
-            # other requests run meanwhile" (co_await)
-            response = await client.get(EXTERNAL_URL, params=params)
-
-            # Turns 4xx/5xx into an exception. Without it, a failed call
-            # looks like a success and you parse garbage.
-            response.raise_for_status()
-
-            posts = response.json()  # parsed JSON -> Python list of dicts (sync, instant)
-
-    except httpx.TimeoutException:  # upstream too slow -> 504 Gateway Timeout
-        raise HTTPException(status_code=504, detail="External API timed out")
-    except httpx.HTTPStatusError as exc:  # upstream replied with an error code
-        raise HTTPException(
-            status_code=502,  # 502 Bad Gateway = "the server behind me failed"
-            detail=f"External API returned {exc.response.status_code}",
-        )
-    except httpx.RequestError:  # DNS failure, refused connection, etc.
-        raise HTTPException(status_code=502, detail="Could not reach external API")
-
-    # Return YOUR shape, not the raw upstream payload (don't leak upstream structure)
-    return {
-        "source": "jsonplaceholder",
-        "count": len(posts),
-        "posts": [{"id": p["id"], "title": p["title"]} for p in posts],
-    }
-
-
+@app.delete("/items/{item_id}")                        # {item_id} = path parameter, passed to the function below
+def delete_item(item_id: int):                         # `: int` makes FastAPI convert and validate the path value ("abc" -> 422)
+    res = supabase.table(TABLE).delete().eq("id", item_id).execute()  # .eq("id", x) = WHERE id = x. FORGET .eq() AND YOU DELETE EVERY ROW.
+    if not res.data:                                   # delete returns the removed rows; empty list = nothing matched
+        raise HTTPException(status_code=404, detail=f"Item {item_id} not found")  # f"..." = string interpolation, like "..." + id in Java
+    return {"deleted": item_id}
